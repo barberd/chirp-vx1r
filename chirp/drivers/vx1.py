@@ -1,4 +1,4 @@
-# Copyright 2025 Don Barber <don@dgb3.net>, N3LP
+# Copyright 2026 Don Barber <don@dgb3.net>, N3LP
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -67,9 +67,9 @@ MEM_FORMAT = """
 #seekto 0x0000;
 // Must match radio's current active mode or default hardware mode
 // for clone to be accepted.
-u8 match_mode;
-// This is the radio's current mode (I think). It is how a new mode is set
-// when writing (also see 0x0301)
+u8 match_mode_0;
+// This is the radio's current mode and how a new mode is set
+// when writing
 u8 mode_byte;
 
 #seekto 0x0002;
@@ -78,7 +78,7 @@ u8 band;
 #seekto 0x0007;
 u8 ars:1, atmd:1, resume:1, scnl:1, beep:1, bclo:1, bsyled:1, unknown0:1;
 u8 rxsave:3, apo:3, lamp:2;
-u8 bell:2, unknown1a:2, lock:3, lk:1;
+u8 bell:3, unknown1a:1, lock:3, lk:1;
 u8 montc:1, dialm:1, tot:3, smtmd:1, artsbp:2;
 u8 unknown2a:1, cwid:1, grp:1, unknown2b:5;
 
@@ -133,10 +133,8 @@ struct {
 #seekto 0x02f1;
 u8 cwid_text[9];  // 8 chars max + stop byte (0x3d)
 
-#seekto 0x0300;
-// Hardware default mode byte (read-only, for clone compatibility)
-u8 hardware_default_mode;
-u8 requested_mode;  // Requested configuration (duplicate of 0x0001)
+#seekto 0x0301;
+u8 match_mode_301;
 
 #seekto 0x0311;
 struct {
@@ -420,8 +418,30 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
                 filedata[0xE6:0xEB] == b"YAESU")
 
     def sync_out(self):
-        self.pipe.timeout = 3
-        return super().sync_out()
+        # 9600 8N1 baud for 4818 bytes = 5.02 seconds
+        self.pipe.timeout = 7
+        try:
+            return super().sync_out()
+        except Exception as e:
+            # Some firmware versions of the VX1 seem to put out extra
+            # 0x00 bytes before sending the ack byte.
+            # I suspect these were processing debug statements left in by
+            # accident and removed in later firmwares.
+            if "Radio did not ack block" in str(e):
+                old_timeout = self.pipe.timeout
+                # Don't make the user wait too long here, so reducing
+                # the timeout to 10ms
+                self.pipe.timeout = .01
+                buf = self.pipe.read(10)
+                self.pipe.timeout = old_timeout
+                if buf and buf[-1] == self._cmd_ack:
+                    status = chirp_common.Status()
+                    status.msg = "Cloning to radio"
+                    status.max = 100
+                    status.cur = 100
+                    self.status_fn(status)
+                    return
+            raise
 
     def _get_band_index(self, freq):
         """Determine which band a frequency belongs to"""
@@ -485,6 +505,11 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
     def process_mmap(self):
         self._memobj = bitwise.parse(MEM_FORMAT, self._mmap)
 
+        # Copy match bytes on first load if not already processed
+        if not self.metadata.get('match_byte_processed', False):
+            self._mmap[0] = self._mmap[1]
+            self.metadata = {'match_byte_processed': True}
+
     def get_settings(self):
         _settings = self._memobj
 
@@ -493,60 +518,50 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
 
         # Old mode bytes (for clone compatibility)
         rs = RadioSetting(
-            "match_mode", "Match Mode (Read Only)",
+            "match_mode_0", "Match Mode 0",
             RadioSettingValueString(
-                0, 4, f"{int(_settings.match_mode):02X}", autopad=False))
-        rs.set_doc("Read-only: Must match radio's current active mode for "
-                   "clone to be accepted (hex format)")
-        basic.append(rs)
-
-        rs = RadioSetting(
-            "hardware_default_mode", "Hardware Default Mode (Read Only)",
-            RadioSettingValueString(
-                0, 4, f"{int(_settings.hardware_default_mode):02X}",
-                autopad=False))
-        rs.set_doc("Read-only: Hardware default mode byte (factory setting)")
+                2, 2, f"{int(_settings.match_mode_0):02X}", autopad=False,
+                charset="0123456789ABCDEFabcdef"))
+        rs.set_doc("Matched this to radio to allow clone-in. Set these to "
+                   "match radio (check with a fresh download) if radio "
+                   "resets to CLONE on first byte received during CLONE IN.")
         basic.append(rs)
 
         # Region/TX expansion mode (bits 7-6 always set = 0xC0,
         # bits 2-0 = country)
         country = int(_settings.mode_byte) & 0x07
-        # Read-only settings - can cause communication issues if changed
         rs = RadioSetting(
-            "country", "Country (Read Only)",
+            "country", "Country",
             RadioSettingValueList(
                 ["FreeBand", "UK", "Unknown (2)", "USA", "Unknown (4)",
                  "Germany", "Europe", "Unknown (7)"],
                 current_index=country))
         # If you know what country codes 2, 4, or 7 represent, either
         # contact me or submit a pull request.
-        rs.set_doc("Read-only to prevent communication issues")
         basic.append(rs)
 
         rs = RadioSetting(
-            "wide_tx", "Wide TX (Read Only)",
+            "wide_tx", "Wide TX",
             RadioSettingValueBoolean(bool(int(_settings.mode_byte) & 0x08)))
-        rs.set_doc("Read-only to prevent communication issues")
         basic.append(rs)
 
         # Read-only setting - can cause communication issues if changed
         rs = RadioSetting(
-            "cellular_rx", "Cellular RX (Read Only)",
+            "cellular_rx", "Cellular RX",
             RadioSettingValueBoolean(bool(int(_settings.mode_byte) & 0x10)))
-        rs.set_doc("Read-only to prevent communication issues")
         basic.append(rs)
 
         # Read-only setting - can cause communication issues if changed
         rs = RadioSetting(
-            "wide_rx", "Wide RX (Read Only)",
+            "wide_rx", "Wide RX",
             RadioSettingValueBoolean(bool(int(_settings.mode_byte) & 0x20)))
-        rs.set_doc("Read-only to prevent communication issues")
         basic.append(rs)
 
         rs = RadioSetting(
             "band", "Current Band",
             RadioSettingValueList(
-                ["FM", "AIR", "V-HAM", "U-HAM", "ACT1", "ACT2", "UHF-TV"],
+                ["BCBAND", "FM", "AIR", "VHF-HAM", "VHF-TV", "ACT1",
+                 "UHF-HAM", "UHF-TV", "ACT2"],
                 current_index=_settings.band))
         basic.append(rs)
 
@@ -575,7 +590,7 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
         basic.append(rs)
 
         rs = RadioSetting(
-            "beep", "Beep",
+            "beep", "Keypad Beep",
             RadioSettingValueBoolean(_settings.beep))
         basic.append(rs)
 
@@ -587,7 +602,7 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
         rs = RadioSetting(
             "bell", "Bell",
             RadioSettingValueList(
-                ["Off", "1", "3", "5"],
+                ["Off", "1 Ring", "3 Ring", "5 Ring", "8 Ring", "Repeat"],
                 current_index=_settings.bell))
         basic.append(rs)
 
@@ -610,7 +625,9 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
 
         rs = RadioSetting(
             "dialm", "Dial Mode",
-            RadioSettingValueBoolean(_settings.dialm))
+            RadioSettingValueList(
+                ["Frequency", "Volume/Squelch"],
+                current_index=_settings.dialm))
         basic.append(rs)
 
         rs = RadioSetting(
@@ -646,8 +663,10 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
         basic.append(rs)
 
         rs = RadioSetting(
-            "montc", "Monitor",
-            RadioSettingValueBoolean(_settings.montc))
+            "montc", "Monitor/TCall",
+            RadioSettingValueList(
+                ["Monitor", "Tone Calling"],
+                current_index=_settings.montc))
         basic.append(rs)
 
         rs = RadioSetting(
@@ -671,7 +690,9 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
 
         rs = RadioSetting(
             "smtmd", "Smart Search",
-            RadioSettingValueBoolean(_settings.smtmd))
+            RadioSettingValueList(
+                ["Single", "Continuous"],
+                current_index=_settings.smtmd))
         basic.append(rs)
 
         rs = RadioSetting(
@@ -722,11 +743,37 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
                 self.set_settings(element)
                 continue
             try:
-                if element.get_name() in ["hardware_default_mode", "country",
-                                          "wide_tx", "cellular_rx", "wide_rx",
-                                          "match_mode"]:
-                    # Read-only settings - ignore changes
-                    continue
+                if element.get_name() == "country":
+                    # Read current byte to preserve expansion bits
+                    current = int(self._memobj.mode_byte)
+                    # Clear country bits (0-2), keep expansion bits (3-5)
+                    # and fixed bits (6-7)
+                    mode_byte = (current & 0xF8) | int(element.value)
+                    self._memobj.mode_byte = mode_byte
+                elif element.get_name() == "match_mode_0":
+                    self._memobj.match_mode_0 = \
+                        int(element.value.get_value(), 16)
+                elif element.get_name() == "wide_tx":
+                    current = int(self._memobj.mode_byte)
+                    if element.value:
+                        mode_byte = current | 0x08
+                    else:
+                        mode_byte = current & ~0x08
+                    self._memobj.mode_byte = mode_byte
+                elif element.get_name() == "cellular_rx":
+                    current = int(self._memobj.mode_byte)
+                    if element.value:
+                        mode_byte = current | 0x10
+                    else:
+                        mode_byte = current & ~0x10
+                    self._memobj.mode_byte = mode_byte
+                elif element.get_name() == "wide_rx":
+                    current = int(self._memobj.mode_byte)
+                    if element.value:
+                        mode_byte = current | 0x20
+                    else:
+                        mode_byte = current & ~0x20
+                    self._memobj.mode_byte = mode_byte
                 # Commented out country setting handler - can prevent
                 # clone-out if radio is set to something that doesn't match
                 # hardware.
@@ -779,8 +826,8 @@ class VX1Radio(yaesu_clone.YaesuCloneModeRadio):
                 LOG.debug(element.get_name())
                 raise
 
-        # Mirror configuration data from 0x0-0x10 to 0x300-0x310
-        for i in range(0x11):  # 17 bytes (0x0 through 0x10)
+        # Mirror configuration data from 0x1-0x11 to 0x301-0x310
+        for i in range(1, 0x11):  # 16 bytes (0x1 through 0x10)
             self._mmap[0x300 + i] = self._mmap[i]
 
 
